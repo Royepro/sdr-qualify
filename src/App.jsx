@@ -62,26 +62,48 @@ const downloadICS = (task, lead) => {
 };
 
 /* ══ PIPEDRIVE ══ */
-const IS_VERCEL = typeof window !== 'undefined' && !window.location.hostname.includes('claude');
+// On Vercel: use /api/pipedrive proxy (token stays server-side, no CORS).
+// On Claude.ai / localhost: direct API call with token in URL.
+const HOSTNAME   = typeof window !== 'undefined' ? window.location.hostname : '';
+const USE_PROXY  = HOSTNAME !== 'localhost' &&
+                   HOSTNAME !== '127.0.0.1' &&
+                   !HOSTNAME.includes('claude.ai') &&
+                   !HOSTNAME.includes('anthropic');
+
+console.log('[SDR] USE_PROXY =', USE_PROXY, '| host =', HOSTNAME);
+
 const PD = {
-  base: IS_VERCEL ? '/api/pipedrive' : 'https://api.pipedrive.com/v1',
-  async req(token,path,method="GET",body=null){
-    if(!token) throw new Error("אין Token");
-    let url, headers = {};
-    if(IS_VERCEL){
-      // Use serverless proxy — token goes in header, never in URL
-      const cleanPath = path.replace(/^\//, '').replace(/\?.*/,'');
-      const qs = path.includes('?') ? '&'+path.split('?')[1] : '';
-      url = `/api/pipedrive?path=${encodeURIComponent(cleanPath)}${qs}`;
-      headers = { 'Content-Type':'application/json', 'x-pd-token': token };
+  async req(token, path, method="GET", body=null) {
+    if (!token && !USE_PROXY) throw new Error("אין Token");
+
+    let url, headers = { 'Content-Type': 'application/json' };
+
+    if (USE_PROXY) {
+      // Serverless proxy — token lives in process.env.PD_TOKEN on Vercel
+      const cleanPath = path.replace(/^\/+/, '').split('?')[0];
+      const qs        = path.includes('?') ? '&' + path.split('?')[1] : '';
+      url             = `/api/pipedrive?pdpath=${encodeURIComponent(cleanPath)}${qs}`;
+      if (token) headers['x-pd-token'] = token; // optional override
+      console.log(`[PD] → PROXY ${method} ${cleanPath}`);
     } else {
-      const sep = path.includes("?")?"&":"?";
-      url = `https://api.pipedrive.com/v1${path}${sep}api_token=${token}`;
-      if(body) headers['Content-Type'] = 'application/json';
+      // Direct Pipedrive call (Claude.ai / localhost)
+      const sep = path.includes('?') ? '&' : '?';
+      url       = `https://api.pipedrive.com/v1${path}${sep}api_token=${token}`;
+      console.log(`[PD] → DIRECT ${method} ${path}`);
     }
-    const r = await fetch(url,{method,headers,body:body?JSON.stringify(body):undefined});
-    const j = await r.json();
-    if(!j.success) throw new Error(j.error||"PD error");
+
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+
+    const j = await res.json();
+    if (!j.success) {
+      console.error('[PD] Error:', j.error, j);
+      throw new Error(j.error || 'Pipedrive error');
+    }
+    console.log('[PD] OK:', method, path, '→ id:', j.data?.id ?? '—');
     return j;
   },
   searchOrg:(t,q)=>PD.req(t,`/organizations/search?term=${encodeURIComponent(q)}&fields=name&limit=5`),
@@ -91,6 +113,35 @@ const PD = {
   addNote:(t,d)=>PD.req(t,"/notes","POST",d),
   createLead:(t,d)=>PD.req(t,"/leads","POST",d),
 };
+
+
+/* ══ TOAST NOTIFICATIONS ══ */
+function useToast() {
+  const [toasts, setToasts] = useState([]);
+  const add = (msg, type='info') => {
+    const id = uid();
+    setToasts(t => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4500);
+  };
+  return { toasts, success: m=>add(m,'success'), error: m=>add(m,'error'), info: m=>add(m,'info') };
+}
+
+function ToastContainer({ toasts }) {
+  return (
+    <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',
+      zIndex:9999,display:'flex',flexDirection:'column',gap:8,alignItems:'center',pointerEvents:'none'}}>
+      {toasts.map(t=>(
+        <div key={t.id} style={{padding:'10px 22px',borderRadius:10,fontSize:13,fontWeight:700,
+          background:t.type==='success'?'#22c55e':t.type==='error'?'#ef4444':'#f59e0b',
+          color:'#000',boxShadow:'0 4px 20px #0006',animation:'toastIn .2s ease',
+          whiteSpace:'nowrap',maxWidth:'90vw',textAlign:'center'}}>
+          {t.type==='success'?'✅ ':t.type==='error'?'❌ ':'ℹ️ '}{t.msg}
+        </div>
+      ))}
+      <style>{`@keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}`}</style>
+    </div>
+  );
+}
 
 /* ══ STYLES ══ */
 const S = {
@@ -1072,30 +1123,68 @@ function LeadModal({lead:init,onSave,onDelete,onClose,apiToken}){
     },600);
   },[apiToken]);
 
-  const handleSave=async()=>{
-    let updated={...lead};
-    // Create or link org in Pipedrive
-    if(apiToken&&lead.company){
+  const handleSave = async () => {
+    let updated = { ...lead };
+    // ── Pipedrive sync ──
+    if (lead.company && (apiToken || USE_PROXY)) {
       setPdStatus("creating");
-      try{
-        let orgId=lead.pipedriveOrgId;
-        if(!orgId){
-          const orgRes=await PD.createOrg(apiToken,lead.company);
-          orgId=orgRes.data.id;
-          updated.pipedriveOrgId=orgId;
-          if(lead.contact){
-            const pr=await PD.createPerson(apiToken,{name:lead.contact,org_id:orgId,phone:[{value:lead.phone||"",primary:true}],email:[{value:lead.email||"",primary:true}]});
-            updated.pipedrivePersonId=pr.data.id;
+      console.log('[LeadModal] Starting Pipedrive sync for', lead.company);
+      try {
+        let orgId = lead.pipedriveOrgId;
+
+        if (!orgId) {
+          console.log('[LeadModal] Creating org:', lead.company);
+          const orgRes = await PD.createOrg(apiToken, lead.company);
+          orgId = orgRes.data.id;
+          updated.pipedriveOrgId = orgId;
+          console.log('[LeadModal] Org created, id:', orgId);
+
+          if (lead.contact) {
+            console.log('[LeadModal] Creating person:', lead.contact);
+            const pr = await PD.createPerson(apiToken, {
+              name:  lead.contact,
+              org_id: orgId,
+              phone: [{ value: lead.phone||"", primary: true }],
+              email: [{ value: lead.email||"", primary: true }],
+            });
+            updated.pipedrivePersonId = pr.data.id;
+            console.log('[LeadModal] Person created, id:', pr.data.id);
           }
+        } else {
+          console.log('[LeadModal] Org already linked, id:', orgId);
         }
-        // Push qualification note to Pipedrive
-        const noteContent=`🎯 SDR Qualification\nסיווג: ${tier.emoji} ${tier.label}\nFit: ${fitScore(lead.scores)}/60 | BANT: ${bantScore(lead.scores)}/40 | סה"כ: ${score}/100\n\n${CRITERIA.filter(c=>c.group==="bant").map(c=>`${c.label}: ${lead.scores?.[c.id]||0}`).join(" | ")}\n\nהערות SDR:\n${lead.notes||"—"}`;
-        await PD.addNote(apiToken,{content:noteContent,org_id:orgId,...(updated.pipedrivePersonId?{person_id:updated.pipedrivePersonId}:{})});
-        // Update org label
-        await PD.updateOrg(apiToken,orgId,{label:tier.label});
+
+        // Push qualification note
+        const noteContent = [
+          `🎯 SDR Qualification — ${lead.company}`,
+          `סיווג: ${tier.emoji} ${tier.label}`,
+          `Fit: ${fitScore(lead.scores)}/60 | BANT: ${bantScore(lead.scores)}/40 | סה"כ: ${score}/100`,
+          '',
+          CRITERIA.filter(c=>c.group==="bant").map(c=>`${c.label}: ${lead.scores?.[c.id]||0}`).join(' | '),
+          '',
+          `הערות SDR:\n${lead.notes||"—"}`,
+        ].join('\n');
+
+        await PD.addNote(apiToken, {
+          content: noteContent,
+          org_id:  orgId,
+          ...(updated.pipedrivePersonId ? { person_id: updated.pipedrivePersonId } : {}),
+        });
+        console.log('[LeadModal] Note added ✓');
+
+        await PD.updateOrg(apiToken, orgId, { label: tier.label });
+        console.log('[LeadModal] Org label updated to', tier.label, '✓');
+
         setPdStatus("done");
-      }catch(ex){setPdStatus("warn: "+ex.message);}
+      } catch(ex) {
+        console.error('[LeadModal] Pipedrive sync error:', ex.message);
+        setPdStatus("warn: " + ex.message);
+      }
+    } else {
+      console.log('[LeadModal] Skipping Pipedrive sync (no token, no proxy, or no company)');
     }
+
+    console.log('[LeadModal] Calling onSave with pipedriveOrgId:', updated.pipedriveOrgId||'—');
     onSave(updated);
   };
 
@@ -1262,13 +1351,59 @@ export default function App(){
   const [filter,setFilter]=useState("all");
   const [sort,setSort]=useState("score");
   const [ready,setReady]=useState(false);
+  const toast = useToast();
 
-  useEffect(()=>{(async()=>{try{const r=await window.storage.get("sdr_v5");if(r){const d=JSON.parse(r.value);setLeads(d.leads||[]);setApiToken(d.token||"");}}catch{}setReady(true);})();},[]);
+  useEffect(()=>{
+    (async()=>{
+      try {
+        console.log('[App] Loading from storage...');
+        const r = await window.storage.get("sdr_v5");
+        if (r) {
+          const d = JSON.parse(r.value);
+          setLeads(d.leads||[]);
+          setApiToken(d.token||"");
+          console.log('[App] Loaded', (d.leads||[]).length, 'leads');
+        } else {
+          console.log('[App] No saved data found');
+        }
+      } catch(e) {
+        console.error('[App] Load error:', e);
+      }
+      setReady(true);
+    })();
+  },[]);
 
-  const persist=async(l,t)=>{const l2=l??leads;const t2=t??apiToken;setLeads(l2);if(t!==undefined)setApiToken(t);try{await window.storage.set("sdr_v5",JSON.stringify({leads:l2,token:t2}));}catch{}};
+  const persist = async (l, t) => {
+    const l2 = l ?? leads;
+    const t2 = t ?? apiToken;
+    setLeads(l2);
+    if (t !== undefined) setApiToken(t);
+    try {
+      const payload = JSON.stringify({ leads: l2, token: t2 });
+      const result  = await window.storage.set("sdr_v5", payload);
+      if (!result) throw new Error('storage.set returned null');
+      console.log('[App] Saved', l2.length, 'leads to storage ✓');
+    } catch(e) {
+      console.error('[App] Save error:', e);
+      toast.error('שגיאת שמירה: ' + e.message);
+    }
+  };
 
-  const handleSaveLead=async lead=>{const updated=lead.id?leads.map(l=>l.id===lead.id?lead:l):[...leads,{...lead,id:uid(),createdAt:new Date().toISOString()}];await persist(updated);setModal(null);};
-  const handleDelete=async id=>{await persist(leads.filter(l=>l.id!==id));setModal(null);};
+  const handleSaveLead = async lead => {
+    console.log('[App] Saving lead:', lead.company, '| pipedriveOrgId:', lead.pipedriveOrgId||'—');
+    const updated = lead.id
+      ? leads.map(l => l.id===lead.id ? lead : l)
+      : [...leads, { ...lead, id:uid(), createdAt:new Date().toISOString() }];
+    await persist(updated);
+    toast.success(lead.id ? `עודכן: ${lead.company}` : `נוצר: ${lead.company}`);
+    setModal(null);
+  };
+
+  const handleDelete = async id => {
+    await persist(leads.filter(l => l.id !== id));
+    toast.info('הליד נמחק');
+    setModal(null);
+  };
   const handleImport=async imported=>{const ex=new Set(leads.map(l=>l.company?.trim().toLowerCase()));const fresh=imported.filter(l=>!ex.has(l.company?.trim().toLowerCase()));await persist([...leads,...fresh]);if(imported.length-fresh.length>0)alert(`יובאו ${fresh.length}. ${imported.length-fresh.length} כפילויות דולגו.`);};
   const handleTaskUpdate=async(leadId,taskId,updates)=>{const updated=leads.map(l=>l.id!==leadId?l:{...l,tasks:(l.tasks||[]).map(t=>t.id===taskId?{...t,...updates}:t)});await persist(updated);};
   const handleAddTask=async(leadId,task)=>{const updated=leads.map(l=>l.id!==leadId?l:{...l,tasks:[...(l.tasks||[]),task]});await persist(updated);};
@@ -1420,6 +1555,7 @@ export default function App(){
       {showImport&&<ImportModal onImport={handleImport} onClose={()=>setShowImport(false)}/>}
       {showSettings&&<SettingsModal token={apiToken} onSave={t=>{persist(null,t);setShowSettings(false);}} onClose={()=>setShowSettings(false)}/>}
       {quickTask&&<QuickTaskModal defaultDate={quickTask.date} defaultHour={quickTask.hour} leads={leads} onAdd={handleAddTask} onClose={()=>setQuickTask(null)}/>}
+      <ToastContainer toasts={toast.toasts}/>
     </div>
   );
 }

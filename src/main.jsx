@@ -2,30 +2,44 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 
-// Persistent storage — uses localStorage on Vercel
+// ── Storage polyfill: localStorage with in-memory fallback ──
+const _mem = {};
 window.storage = {
   async get(key) {
     try {
-      const val = localStorage.getItem('sdrq_' + key)
-      return val ? { key, value: val } : null
-    } catch { return null }
+      const raw = localStorage.getItem('sdrq_' + key);
+      if (raw) {
+        console.log(`[Storage] GET "${key}" — ${raw.length} chars`);
+        return { key, value: raw };
+      }
+      console.log(`[Storage] GET "${key}" — empty`);
+      return null;
+    } catch (e) {
+      console.warn('[Storage] localStorage.getItem failed, using memory:', e.message);
+      const v = _mem[key];
+      return v ? { key, value: v } : null;
+    }
   },
   async set(key, value) {
+    _mem[key] = value; // always write to memory too
     try {
-      localStorage.setItem('sdrq_' + key, value)
-      return { key, value }
-    } catch { return null }
+      localStorage.setItem('sdrq_' + key, value);
+      console.log(`[Storage] SET "${key}" — ${value.length} chars ✓`);
+      return { key, value };
+    } catch (e) {
+      console.warn('[Storage] localStorage.setItem failed (quota?):', e.message);
+      return { key, value }; // memory-only fallback
+    }
   },
   async delete(key) {
-    try {
-      localStorage.removeItem('sdrq_' + key)
-      return { key, deleted: true }
-    } catch { return null }
+    delete _mem[key];
+    try { localStorage.removeItem('sdrq_' + key); } catch {}
+    return { key, deleted: true };
   }
-}
+};
+
+console.log('[SDR.qualify] Starting on', window.location.hostname);
 
 ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
+  <React.StrictMode><App /></React.StrictMode>
 )
