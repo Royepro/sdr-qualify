@@ -1,6 +1,14 @@
 {
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" },
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/api/auth/login",          "destination": "/api/auth/login" },
+    { "source": "/api/auth/callback",       "destination": "/api/auth/callback" },
+    { "source": "/api/auth/logout",         "destination": "/api/auth/logout" },
+    { "source": "/api/auth/me",             "destination": "/api/auth/me" },
+    { "source": "/api/config",              "destination": "/api/config" },
+    { "source": "/api/pd/search-orgs",      "destination": "/api/pd/search-orgs" },
+    { "source": "/api/pd/search-persons",   "destination": "/api/pd/search-persons" },
+    { "source": "/api/pd/create-lead",      "destination": "/api/pd/create-lead" },
+    { "source": "/api/admin/leads",         "destination": "/api/admin/leads" },
+    { "source": "/(.*)",                    "destination": "/index.html" }
   ]
 }
